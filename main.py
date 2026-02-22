@@ -13,30 +13,25 @@ import uvicorn
 
 load_dotenv()
 
-# Configuration
 RPC_URL = "https://testnet-rpc.monad.xyz/"
-ARENA_ADDRESS = "0xa970eb753d93217Fc12687225889121494EFd41A"
-
+ARENA_ADDRESS = "0xA3ed093D1e3D632a13DC1389028A8fFF1264dADA"
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATA_DIR = os.path.join(_APP_DIR, "data")
-os.makedirs(_DATA_DIR, exist_ok=True)
-
-_FRONTEND_HISTORY = os.path.join(_APP_DIR, "..", "frontend", "public", "history.json")
-HISTORY_FILE = _FRONTEND_HISTORY if os.path.exists(os.path.dirname(_FRONTEND_HISTORY)) else os.path.join(_DATA_DIR, "history.json")
-
-ARENA_ABI = None
 STRATEGIES = ["Sniper", "Hodler", "Degen", "CopyTrader", "Whale"]
+
+# Shared in-memory state -- market loop writes, API reads
+live_state = {
+    "phase": "WAITING",
+    "roundEndTime": 0,
+    "history": [],
+}
+
 
 # ---------- ABI loading ----------
 def load_abi():
-    global ARENA_ABI
-
     abi_env = os.getenv("ARENA_ABI")
     if abi_env:
         try:
-            ARENA_ABI = json.loads(abi_env)
-            print("ABI loaded from ARENA_ABI env var.")
-            return
+            return json.loads(abi_env)
         except Exception as e:
             print(f"Failed to parse ARENA_ABI env var: {e}")
 
@@ -49,14 +44,12 @@ def load_abi():
             try:
                 with open(p, "r") as f:
                     data = json.load(f)
-                ARENA_ABI = data.get("abi", data)
+                abi = data.get("abi", data)
                 print(f"ABI loaded from {p}")
-                return
+                return abi
             except Exception as e:
                 print(f"Failed to load ABI from {p}: {e}")
-
-    print("WARNING: ABI not found. Market loop will not start. "
-          "Set ARENA_ABI env var or add arena_abi.json to the repo.")
+    return None
 
 
 # ---------- FastAPI ----------
@@ -75,32 +68,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "meme-arena-backend"}
 
+
 @app.get("/api/history")
 @app.get("/history")
 def get_history():
-    try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {"phase": "ROUND", "roundEndTime": 0, "history": []}
+    return live_state
+
+
+@app.get("/api/agents")
+def get_agents():
+    """Public agent addresses for the frontend."""
+    path = os.path.join(_APP_DIR, "agent_public.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
 
 
 # ---------- Blockchain background startup ----------
 async def blockchain_startup():
-    """Runs AFTER the API server is already listening."""
     await asyncio.sleep(1)
     print("--- Blockchain init starting ---")
 
-    load_abi()
-    if ARENA_ABI is None:
-        print("Blockchain init aborted: no ABI.")
+    arena_abi = load_abi()
+    if arena_abi is None:
+        print("WARNING: ABI not found. Market loop will not start.")
         return
 
     try:
@@ -109,7 +107,7 @@ async def blockchain_startup():
             print("Error: Could not connect to Monad Testnet")
             return
 
-        arena_contract = w3.eth.contract(address=ARENA_ADDRESS, abi=ARENA_ABI)
+        arena_contract = w3.eth.contract(address=ARENA_ADDRESS, abi=arena_abi)
 
         admin_key = os.getenv("PRIVATE_KEY")
         if not admin_key:
@@ -134,7 +132,7 @@ def create_agents(w3, arena_contract):
     keys_file = os.path.join(_APP_DIR, "agent_keys.json")
     keys = {}
     if os.path.exists(keys_file):
-        with open(keys_file, 'r') as f:
+        with open(keys_file, "r") as f:
             keys = json.load(f)
 
     for strategy in STRATEGIES:
@@ -145,7 +143,7 @@ def create_agents(w3, arena_contract):
             acc = w3.eth.account.create()
             private_key = acc.key.hex()
             keys[agent_name] = private_key
-            with open(keys_file, 'w') as f:
+            with open(keys_file, "w") as f:
                 json.dump(keys, f)
 
         agents.append(MemeAgent(agent_name, private_key, strategy, w3, arena_contract))
@@ -160,11 +158,10 @@ async def register_agents(agents, w3, arena_contract, admin_account, admin_key):
             if arena_contract.functions.isAgent(agent.address).call():
                 print(f"Agent {agent.name} already registered.")
                 continue
-
             print(f"Registering {agent.name}...")
             txn = arena_contract.functions.registerAgent(agent.address).build_transaction({
-                'chainId': 10143, 'gas': 150000,
-                'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
+                "chainId": 10143, "gas": 150000,
+                "gasPrice": int(w3.eth.gas_price * 1.2), "nonce": nonce,
             })
             signed = w3.eth.account.sign_transaction(txn, private_key=admin_key)
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -182,13 +179,13 @@ async def fund_agents(agents, w3, admin_account, admin_key):
     for agent in agents:
         try:
             balance = w3.eth.get_balance(agent.address)
-            bal_mon = w3.from_wei(balance, 'ether')
-            if balance < w3.to_wei(0.005, 'ether'):
+            bal_mon = w3.from_wei(balance, "ether")
+            if balance < w3.to_wei(0.005, "ether"):
                 print(f"Agent {agent.name} low ({bal_mon} MON) - topping up...")
                 tx = {
-                    'nonce': nonce, 'to': agent.address,
-                    'value': w3.to_wei(0.02, 'ether'), 'gas': 21000,
-                    'gasPrice': int(w3.eth.gas_price * 1.2), 'chainId': 10143,
+                    "nonce": nonce, "to": agent.address,
+                    "value": w3.to_wei(0.02, "ether"), "gas": 21000,
+                    "gasPrice": int(w3.eth.gas_price * 1.2), "chainId": 10143,
                 }
                 signed = w3.eth.account.sign_transaction(tx, admin_key)
                 tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -199,6 +196,22 @@ async def fund_agents(agents, w3, admin_account, admin_key):
                 print(f"Agent {agent.name}: {bal_mon} MON (OK)")
         except Exception as e:
             print(f"Failed to fund {agent.name}: {e}")
+
+
+def update_state(phase, round_end_time, history):
+    """Update the shared in-memory state that the API serves."""
+    live_state["phase"] = phase
+    live_state["roundEndTime"] = round_end_time
+    live_state["history"] = list(history)
+
+    # Also write to frontend/public/history.json for local dev
+    local_path = os.path.join(_APP_DIR, "..", "frontend", "public", "history.json")
+    if os.path.exists(os.path.dirname(local_path)):
+        try:
+            with open(local_path, "w") as f:
+                json.dump(live_state, f)
+        except Exception:
+            pass
 
 
 async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
@@ -214,8 +227,8 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
         try:
             nonce = w3.eth.get_transaction_count(admin_account.address)
             tx = arena_contract.functions.setBettingActive(True).build_transaction({
-                'chainId': 10143, 'gas': 80000,
-                'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
+                "chainId": 10143, "gas": 80000,
+                "gasPrice": int(w3.eth.gas_price * 1.2), "nonce": nonce,
             })
             signed = w3.eth.account.sign_transaction(tx, admin_key)
             w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -225,9 +238,7 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
 
         betting_end = time.time() + 30
         while time.time() < betting_end:
-            data = {"phase": "BETTING", "roundEndTime": betting_end, "history": history}
-            with open(HISTORY_FILE, "w") as f:
-                json.dump(data, f)
+            update_state("BETTING", betting_end, history)
             await asyncio.sleep(1)
 
         # Game phase (90s)
@@ -235,8 +246,8 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
         try:
             nonce = w3.eth.get_transaction_count(admin_account.address)
             tx = arena_contract.functions.setBettingActive(False).build_transaction({
-                'chainId': 10143, 'gas': 80000,
-                'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
+                "chainId": 10143, "gas": 80000,
+                "gasPrice": int(w3.eth.gas_price * 1.2), "nonce": nonce,
             })
             signed = w3.eth.account.sign_transaction(tx, admin_key)
             w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -272,9 +283,7 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
             if len(history) > 50:
                 history.pop(0)
 
-            data = {"phase": "ROUND", "roundEndTime": start_time + round_duration, "history": history}
-            with open(HISTORY_FILE, "w") as f:
-                json.dump(data, f)
+            update_state("ROUND", start_time + round_duration, history)
 
             if time.time() - start_time > round_duration:
                 print("\n--- ROUND OVER ---")
@@ -292,8 +301,8 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
                     try:
                         nonce = w3.eth.get_transaction_count(admin_account.address)
                         tx = arena_contract.functions.endRound(winner_agent.address).build_transaction({
-                            'chainId': 10143, 'gas': 500000,
-                            'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
+                            "chainId": 10143, "gas": 500000,
+                            "gasPrice": int(w3.eth.gas_price * 1.2), "nonce": nonce,
                         })
                         signed = w3.eth.account.sign_transaction(tx, admin_key)
                         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)

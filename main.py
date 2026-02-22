@@ -165,9 +165,9 @@ async def register_agents(agents, w3, arena_contract, admin_account, admin_key):
             })
             signed = w3.eth.account.sign_transaction(txn, private_key=admin_key)
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             print(f"Registered {agent.name}: {w3.to_hex(tx_hash)}")
             nonce += 1
-            time.sleep(1)
         except Exception as e:
             print(f"Failed to register {agent.name}: {e}")
     print("Registration complete.")
@@ -189,9 +189,9 @@ async def fund_agents(agents, w3, admin_account, admin_key):
                 }
                 signed = w3.eth.account.sign_transaction(tx, admin_key)
                 tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
                 print(f"Sent 0.02 MON to {agent.name}: {w3.to_hex(tx_hash)}")
                 nonce += 1
-                time.sleep(1)
             else:
                 print(f"Agent {agent.name}: {bal_mon} MON (OK)")
         except Exception as e:
@@ -231,7 +231,8 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
                 "gasPrice": int(w3.eth.gas_price * 1.2), "nonce": nonce,
             })
             signed = w3.eth.account.sign_transaction(tx, admin_key)
-            w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             print("Betting Opened.")
         except Exception as e:
             print(f"Failed to open betting: {e}")
@@ -250,7 +251,8 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
                 "gasPrice": int(w3.eth.gas_price * 1.2), "nonce": nonce,
             })
             signed = w3.eth.account.sign_transaction(tx, admin_key)
-            w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             print("Betting Closed.")
         except Exception as e:
             print(f"Failed to close betting: {e}")
@@ -306,6 +308,7 @@ async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
                         })
                         signed = w3.eth.account.sign_transaction(tx, admin_key)
                         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
                         print(f"Round ended: {w3.to_hex(tx_hash)}")
                     except Exception as e:
                         print(f"Failed to end round: {e}")

@@ -6,21 +6,68 @@ import random
 from web3 import Web3
 from dotenv import load_dotenv
 from agents import MemeAgent
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 # Load environment variables
-load_dotenv(dotenv_path="../contracts/.env") # Try to load from contracts .env if exists, or local
+load_dotenv(dotenv_path="../contracts/.env")  # Try to load from contracts .env if exists, or local
+load_dotenv()  # Also load from current dir / Railway env
 
 # Configuration
 RPC_URL = "https://testnet-rpc.monad.xyz/"
 ARENA_ADDRESS = "0xa970eb753d93217Fc12687225889121494EFd41A" # Deployed Address (v3 - auto-payout + auto-refund)
 
+# History file: use backend-local path for production; fallback to frontend public for local monorepo
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_BACKEND_DIR, "data")
+_FRONTEND_HISTORY = os.path.join(_BACKEND_DIR, "..", "frontend", "public", "history.json")
+HISTORY_FILE = _FRONTEND_HISTORY if os.path.exists(os.path.dirname(_FRONTEND_HISTORY)) else os.path.join(_DATA_DIR, "history.json")
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+# API app with CORS - allow any origin (localhost, Vercel, etc.)
+app = FastAPI(title="Meme Arena Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "meme-arena-backend"}
+
+@app.get("/api/history")
+@app.get("/history")
+def get_history():
+    """Serve history for any frontend (local, Vercel, etc.)"""
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"phase": "ROUND", "roundEndTime": 0, "history": []}
+
 # Read ABI
-try:
-    with open("../contracts/artifacts/contracts/Arena.sol/Arena.json", "r") as f:
-        contract_json = json.load(f)
-        ARENA_ABI = contract_json["abi"]
-except FileNotFoundError:
-    print("Error: ABI file not found. Make sure you complied the contracts.")
+_ABI_PATHS = [
+    os.path.join(_BACKEND_DIR, "..", "contracts", "artifacts", "contracts", "Arena.sol", "Arena.json"),
+    os.path.join(_BACKEND_DIR, "arena_abi.json"),
+]
+ARENA_ABI = None
+for p in _ABI_PATHS:
+    if os.path.exists(p):
+        try:
+            with open(p, "r") as f:
+                ARENA_ABI = json.load(f)["abi"]
+            break
+        except Exception:
+            pass
+if ARENA_ABI is None:
+    print("Error: ABI file not found. Add Arena.json to backend/ or contracts/artifacts/")
     exit(1)
 
 # Initialize Web3
@@ -109,7 +156,6 @@ def create_agents():
 async def market_loop(agents):
     print("Starting Market Loop...")
     history = []
-    HISTORY_FILE = "../frontend/public/history.json"
     start_time = time.time()
 
     while True: # Outer Loop for Rounds
@@ -278,19 +324,19 @@ async def fund_agents(agents):
     else:
         print("All agents have sufficient balance.")
 
+async def run_market_and_api(agents):
+    """Run API server and market loop concurrently."""
+    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="info")
+    server = uvicorn.Server(config)
+    api_task = asyncio.create_task(server.serve())
+    market_task = asyncio.create_task(market_loop(agents))
+    await asyncio.gather(api_task, market_task)
+
 async def main():
     agents = create_agents()
-    
-    # Funding
     await fund_agents(agents)
-
-    
-    # We need to register them on-chain using the Admin key
-    # Only do this if they are not allowed to trade.
     await register_agents(agents)
-    
-    # Start the loop
-    await market_loop(agents)
+    await run_market_and_api(agents)
 
 if __name__ == "__main__":
     asyncio.run(main())

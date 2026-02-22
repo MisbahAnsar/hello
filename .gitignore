@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+/backend/__pycache__/
+*.pyc
+
+# Build outputs
+/frontend/.next/
+/frontend/out/
+/contracts/artifacts/
+/contracts/cache/
+/contracts/typechain-types/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

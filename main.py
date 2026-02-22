@@ -8,25 +8,65 @@ from dotenv import load_dotenv
 from agents import MemeAgent
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import uvicorn
 
-# Load environment variables
-load_dotenv(dotenv_path="../contracts/.env")  # Try to load from contracts .env if exists, or local
-load_dotenv()  # Also load from current dir / Railway env
+load_dotenv()
 
 # Configuration
 RPC_URL = "https://testnet-rpc.monad.xyz/"
-ARENA_ADDRESS = "0xa970eb753d93217Fc12687225889121494EFd41A" # Deployed Address (v3 - auto-payout + auto-refund)
+ARENA_ADDRESS = "0xa970eb753d93217Fc12687225889121494EFd41A"
 
-# History file: use backend-local path for production; fallback to frontend public for local monorepo
-_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATA_DIR = os.path.join(_BACKEND_DIR, "data")
-_FRONTEND_HISTORY = os.path.join(_BACKEND_DIR, "..", "frontend", "public", "history.json")
-HISTORY_FILE = _FRONTEND_HISTORY if os.path.exists(os.path.dirname(_FRONTEND_HISTORY)) else os.path.join(_DATA_DIR, "history.json")
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_APP_DIR, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
-# API app with CORS - allow any origin (localhost, Vercel, etc.)
-app = FastAPI(title="Meme Arena Backend")
+_FRONTEND_HISTORY = os.path.join(_APP_DIR, "..", "frontend", "public", "history.json")
+HISTORY_FILE = _FRONTEND_HISTORY if os.path.exists(os.path.dirname(_FRONTEND_HISTORY)) else os.path.join(_DATA_DIR, "history.json")
+
+ARENA_ABI = None
+STRATEGIES = ["Sniper", "Hodler", "Degen", "CopyTrader", "Whale"]
+
+# ---------- ABI loading ----------
+def load_abi():
+    global ARENA_ABI
+
+    abi_env = os.getenv("ARENA_ABI")
+    if abi_env:
+        try:
+            ARENA_ABI = json.loads(abi_env)
+            print("ABI loaded from ARENA_ABI env var.")
+            return
+        except Exception as e:
+            print(f"Failed to parse ARENA_ABI env var: {e}")
+
+    paths = [
+        os.path.join(_APP_DIR, "arena_abi.json"),
+        os.path.join(_APP_DIR, "..", "contracts", "artifacts", "contracts", "Arena.sol", "Arena.json"),
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r") as f:
+                    data = json.load(f)
+                ARENA_ABI = data.get("abi", data)
+                print(f"ABI loaded from {p}")
+                return
+            except Exception as e:
+                print(f"Failed to load ABI from {p}: {e}")
+
+    print("WARNING: ABI not found. Market loop will not start. "
+          "Set ARENA_ABI env var or add arena_abi.json to the repo.")
+
+
+# ---------- FastAPI ----------
+@asynccontextmanager
+async def lifespan(application):
+    task = asyncio.create_task(blockchain_startup())
+    yield
+    task.cancel()
+
+app = FastAPI(title="Meme Arena Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,7 +83,6 @@ def health():
 @app.get("/api/history")
 @app.get("/history")
 def get_history():
-    """Serve history for any frontend (local, Vercel, etc.)"""
     try:
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "r") as f:
@@ -52,94 +91,54 @@ def get_history():
         pass
     return {"phase": "ROUND", "roundEndTime": 0, "history": []}
 
-# Read ABI
-_ABI_PATHS = [
-    os.path.join(_BACKEND_DIR, "..", "contracts", "artifacts", "contracts", "Arena.sol", "Arena.json"),
-    os.path.join(_BACKEND_DIR, "arena_abi.json"),
-]
-ARENA_ABI = None
-for p in _ABI_PATHS:
-    if os.path.exists(p):
-        try:
-            with open(p, "r") as f:
-                ARENA_ABI = json.load(f)["abi"]
-            break
-        except Exception:
-            pass
-if ARENA_ABI is None:
-    print("Error: ABI file not found. Add Arena.json to backend/ or contracts/artifacts/")
-    exit(1)
 
-# Initialize Web3
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
-if not w3.is_connected():
-    print("Error: Could not connect to Monad Testnet")
-    exit(1)
+# ---------- Blockchain background startup ----------
+async def blockchain_startup():
+    """Runs AFTER the API server is already listening."""
+    await asyncio.sleep(1)
+    print("--- Blockchain init starting ---")
 
-arena_contract = w3.eth.contract(address=ARENA_ADDRESS, abi=ARENA_ABI)
+    load_abi()
+    if ARENA_ABI is None:
+        print("Blockchain init aborted: no ABI.")
+        return
 
-# Strategy Definitions
-STRATEGIES = ["Sniper", "Hodler", "Degen", "CopyTrader", "Whale"]
+    try:
+        w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        if not w3.is_connected():
+            print("Error: Could not connect to Monad Testnet")
+            return
 
-# Generate or Load Agents
-# For MVP, we use the same PRIVATE_KEY from .env for all agents? 
-# NO, that would cause nonce issues if they run concurrently.
-# We should generate random accounts for them or mock them.
-# BUT the contract requires them to be whitelisted ("registerAgent").
-# So we must register them first. 
-# SIMPLIFICATION: We will generate 5 random wallets, and use the MAIN DEPLOYER to register them.
+        arena_contract = w3.eth.contract(address=ARENA_ADDRESS, abi=ARENA_ABI)
 
-ADMIN_PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-if not ADMIN_PRIVATE_KEY:
-    print("Error: PRIVATE_KEY not found in env")
-    exit(1)
+        admin_key = os.getenv("PRIVATE_KEY")
+        if not admin_key:
+            print("Error: PRIVATE_KEY not found in env")
+            return
 
-admin_account = w3.eth.account.from_key(ADMIN_PRIVATE_KEY)
+        admin_account = w3.eth.account.from_key(admin_key)
+        print(f"Admin: {admin_account.address}")
 
-async def register_agents(agents):
-    print("Registering agents...")
-    nonce = w3.eth.get_transaction_count(admin_account.address)
-    for agent in agents:
-        # Check if already registered (mock check or call contract)
-        is_registered = arena_contract.functions.isAgent(agent.address).call()
-        if is_registered:
-            print(f"Agent {agent.name} already registered.")
-            continue
+        agents = create_agents(w3, arena_contract)
+        await fund_agents(agents, w3, admin_account, admin_key)
+        await register_agents(agents, w3, arena_contract, admin_account, admin_key)
+        await market_loop(agents, w3, arena_contract, admin_account, admin_key)
+    except Exception as e:
+        print(f"Blockchain startup error: {e}")
 
-        print(f"Registering {agent.name}...")
-        txn = arena_contract.functions.registerAgent(agent.address).build_transaction({
-            'chainId': 10143,
-            'gas': 150000,
-            'gasPrice': int(w3.eth.gas_price * 1.2),
-            'nonce': nonce
-        })
-        signed_txn = w3.eth.account.sign_transaction(txn, private_key=ADMIN_PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-        print(f"Registration tx sent for {agent.name}: {w3.to_hex(tx_hash)}")
-        nonce += 1
-        time.sleep(1) # Avoid rate limits or nonce issues
 
-    print("Registration complete.")
-
-def create_agents():
+# ---------- Agent helpers ----------
+def create_agents(w3, arena_contract):
     agents = []
     print("Creating agents...")
-    for i, strategy in enumerate(STRATEGIES):
-        # Generate a new account
-        # In production, load from a file to persist. 
-        # Here we just generate new ones each run? That requires re-registration.
-        # Better: Save keys to a file `agent_keys.json`
-        
-        agent_name = f"Agent_{strategy}"
-        
-        # Checking for existing keys
-        keys_file = "agent_keys.json"
-        if os.path.exists(keys_file):
-            with open(keys_file, 'r') as f:
-                keys = json.load(f)
-        else:
-            keys = {}
+    keys_file = os.path.join(_APP_DIR, "agent_keys.json")
+    keys = {}
+    if os.path.exists(keys_file):
+        with open(keys_file, 'r') as f:
+            keys = json.load(f)
 
+    for strategy in STRATEGIES:
+        agent_name = f"Agent_{strategy}"
         if agent_name in keys:
             private_key = keys[agent_name]
         else:
@@ -148,86 +147,115 @@ def create_agents():
             keys[agent_name] = private_key
             with open(keys_file, 'w') as f:
                 json.dump(keys, f)
-        
-        agent = MemeAgent(agent_name, private_key, strategy, w3, arena_contract)
-        agents.append(agent)
+
+        agents.append(MemeAgent(agent_name, private_key, strategy, w3, arena_contract))
     return agents
 
-async def market_loop(agents):
+
+async def register_agents(agents, w3, arena_contract, admin_account, admin_key):
+    print("Registering agents...")
+    nonce = w3.eth.get_transaction_count(admin_account.address)
+    for agent in agents:
+        try:
+            if arena_contract.functions.isAgent(agent.address).call():
+                print(f"Agent {agent.name} already registered.")
+                continue
+
+            print(f"Registering {agent.name}...")
+            txn = arena_contract.functions.registerAgent(agent.address).build_transaction({
+                'chainId': 10143, 'gas': 150000,
+                'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
+            })
+            signed = w3.eth.account.sign_transaction(txn, private_key=admin_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"Registered {agent.name}: {w3.to_hex(tx_hash)}")
+            nonce += 1
+            time.sleep(1)
+        except Exception as e:
+            print(f"Failed to register {agent.name}: {e}")
+    print("Registration complete.")
+
+
+async def fund_agents(agents, w3, admin_account, admin_key):
+    print("Checking agent balances...")
+    nonce = w3.eth.get_transaction_count(admin_account.address)
+    for agent in agents:
+        try:
+            balance = w3.eth.get_balance(agent.address)
+            bal_mon = w3.from_wei(balance, 'ether')
+            if balance < w3.to_wei(0.005, 'ether'):
+                print(f"Agent {agent.name} low ({bal_mon} MON) - topping up...")
+                tx = {
+                    'nonce': nonce, 'to': agent.address,
+                    'value': w3.to_wei(0.02, 'ether'), 'gas': 21000,
+                    'gasPrice': int(w3.eth.gas_price * 1.2), 'chainId': 10143,
+                }
+                signed = w3.eth.account.sign_transaction(tx, admin_key)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                print(f"Sent 0.02 MON to {agent.name}: {w3.to_hex(tx_hash)}")
+                nonce += 1
+                time.sleep(1)
+            else:
+                print(f"Agent {agent.name}: {bal_mon} MON (OK)")
+        except Exception as e:
+            print(f"Failed to fund {agent.name}: {e}")
+
+
+async def market_loop(agents, w3, arena_contract, admin_account, admin_key):
     print("Starting Market Loop...")
     history = []
-    start_time = time.time()
 
-    while True: # Outer Loop for Rounds
+    while True:
         print("--- STARTING NEW ROUND ---")
-        
-        # Auto-refund agents if their balance is low
-        await fund_agents(agents)
-        
-        # 1. Open Betting Phase (30s)
+        await fund_agents(agents, w3, admin_account, admin_key)
+
+        # Betting phase (30s)
         print(">>> BETTING PHASE (30s) <<<")
         try:
             nonce = w3.eth.get_transaction_count(admin_account.address)
             tx = arena_contract.functions.setBettingActive(True).build_transaction({
-                'chainId': 10143,
-                'gas': 80000,
-                'gasPrice': int(w3.eth.gas_price * 1.2),
-                'nonce': nonce
+                'chainId': 10143, 'gas': 80000,
+                'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
             })
-            signed_tx = w3.eth.account.sign_transaction(tx, ADMIN_PRIVATE_KEY)
-            w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            signed = w3.eth.account.sign_transaction(tx, admin_key)
+            w3.eth.send_raw_transaction(signed.raw_transaction)
             print("Betting Opened.")
         except Exception as e:
             print(f"Failed to open betting: {e}")
 
-        # Betting Phase Loop (Write to history so frontend knows)
         betting_end = time.time() + 30
         while time.time() < betting_end:
-            timestamp = int(time.time())
-            # Write "BETTING" phase
-            data = {
-                "phase": "BETTING",
-                "roundEndTime": betting_end,
-                "history": history 
-            }
-            # We need to preserve history struct
+            data = {"phase": "BETTING", "roundEndTime": betting_end, "history": history}
             with open(HISTORY_FILE, "w") as f:
                 json.dump(data, f)
-            time.sleep(1)
+            await asyncio.sleep(1)
 
-        # 2. Close Betting & Start Game Phase
+        # Game phase (90s)
         print(">>> GAME PHASE (90s) <<<")
         try:
             nonce = w3.eth.get_transaction_count(admin_account.address)
             tx = arena_contract.functions.setBettingActive(False).build_transaction({
-                'chainId': 10143,
-                'gas': 80000,
-                'gasPrice': int(w3.eth.gas_price * 1.2),
-                'nonce': nonce
+                'chainId': 10143, 'gas': 80000,
+                'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
             })
-            signed_tx = w3.eth.account.sign_transaction(tx, ADMIN_PRIVATE_KEY)
-            w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            signed = w3.eth.account.sign_transaction(tx, admin_key)
+            w3.eth.send_raw_transaction(signed.raw_transaction)
             print("Betting Closed.")
         except Exception as e:
             print(f"Failed to close betting: {e}")
 
         start_time = time.time()
-        round_duration = 90 # Total 120s round (30s bet + 90s game)
-        
-        # Per-round balance tracking (reset each round for fair competition)
+        round_duration = 90
         round_balances = {agent.name: 0 for agent in agents}
-        
-        while True: # Inner Market Loop
-            # 1. Mock Price Update
+
+        while True:
             mock_price = random.uniform(0.1, 10.0)
             print(f"\n--- Market Price: ${mock_price:.2f} ---")
 
-            # 2. Agents Decide
             tasks = []
             for agent in agents:
                 decision, amount = agent.execute_strategy(mock_price)
                 tasks.append(agent.trade(decision, amount))
-                # Track per-round balances locally
                 if decision == "buy":
                     round_balances[agent.name] += amount
                 elif decision == "sell":
@@ -235,108 +263,48 @@ async def market_loop(agents):
 
             await asyncio.gather(*tasks)
 
-            # 3. Update History
-            timestamp = int(time.time())
-            agent_data = {name: bal for name, bal in round_balances.items()}
             entry = {
-                "time": timestamp,
+                "time": int(time.time()),
                 "price": mock_price,
-                "balances": agent_data
+                "balances": dict(round_balances),
             }
             history.append(entry)
             if len(history) > 50:
                 history.pop(0)
-            
-            # Write to file with PHASE="ROUND"
-            data = {
-                "phase": "ROUND",
-                "roundEndTime": start_time + round_duration,
-                "history": history
-            }
+
+            data = {"phase": "ROUND", "roundEndTime": start_time + round_duration, "history": history}
             with open(HISTORY_FILE, "w") as f:
                 json.dump(data, f)
 
-            # 4. Check for Round End
-            elapsed_time = time.time() - start_time
-            if elapsed_time > round_duration:
+            if time.time() - start_time > round_duration:
                 print("\n--- ROUND OVER ---")
-                # Determine Winner from this round's balances
-                highest_balance = 0
                 winner_agent = None
+                highest = 0
                 for agent in agents:
                     bal = round_balances[agent.name]
                     print(f"  {agent.name}: {bal} MEME")
-                    if bal > highest_balance:
-                        highest_balance = bal
+                    if bal > highest:
+                        highest = bal
                         winner_agent = agent
-                
+
                 if winner_agent:
-                    print(f"Winner is {winner_agent.name} with {highest_balance} MEME")
+                    print(f"Winner: {winner_agent.name} with {highest} MEME")
                     try:
                         nonce = w3.eth.get_transaction_count(admin_account.address)
                         tx = arena_contract.functions.endRound(winner_agent.address).build_transaction({
-                            'chainId': 10143,
-                            'gas': 500000,
-                            'gasPrice': int(w3.eth.gas_price * 1.2),
-                            'nonce': nonce
+                            'chainId': 10143, 'gas': 500000,
+                            'gasPrice': int(w3.eth.gas_price * 1.2), 'nonce': nonce,
                         })
-                        signed_tx = w3.eth.account.sign_transaction(tx, ADMIN_PRIVATE_KEY)
-                        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                        print(f"Ended Round! Winners auto-paid, lost bets swept to admin. Tx: {w3.to_hex(tx_hash)}")
+                        signed = w3.eth.account.sign_transaction(tx, admin_key)
+                        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        print(f"Round ended: {w3.to_hex(tx_hash)}")
                     except Exception as e:
                         print(f"Failed to end round: {e}")
-                
-                break # Exit inner loop, start new round
+                break
 
-            # 5. Wait
             await asyncio.sleep(2)
 
 
-    
-async def fund_agents(agents):
-    print("Checking agent balances...")
-    nonce = w3.eth.get_transaction_count(admin_account.address)
-    funded_count = 0
-    for agent in agents:
-        balance = w3.eth.get_balance(agent.address)
-        bal_mon = w3.from_wei(balance, 'ether')
-        
-        if balance < w3.to_wei(0.005, 'ether'):
-            print(f"Agent {agent.name} low ({bal_mon} MON) - topping up with 0.02 MON...")
-            tx = {
-                'nonce': nonce,
-                'to': agent.address,
-                'value': w3.to_wei(0.02, 'ether'),
-                'gas': 21000,
-                'gasPrice': int(w3.eth.gas_price * 1.2),
-                'chainId': 10143
-            }
-            signed_tx = w3.eth.account.sign_transaction(tx, ADMIN_PRIVATE_KEY)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            print(f"Sent 0.02 MON to {agent.name}: {w3.to_hex(tx_hash)}")
-            nonce += 1
-            funded_count += 1
-            time.sleep(1)
-        else:
-            print(f"Agent {agent.name}: {bal_mon} MON (OK)")
-    if funded_count > 0:
-        print(f"Funded {funded_count} agents.")
-    else:
-        print("All agents have sufficient balance.")
-
-async def run_market_and_api(agents):
-    """Run API server and market loop concurrently."""
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="info")
-    server = uvicorn.Server(config)
-    api_task = asyncio.create_task(server.serve())
-    market_task = asyncio.create_task(market_loop(agents))
-    await asyncio.gather(api_task, market_task)
-
-async def main():
-    agents = create_agents()
-    await fund_agents(agents)
-    await register_agents(agents)
-    await run_market_and_api(agents)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
